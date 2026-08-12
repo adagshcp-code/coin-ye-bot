@@ -1,0 +1,11 @@
+services:
+    - type: worker
+    name: coin-ye-bot
+    env: python
+    region: frankfurt
+    plan: free
+    buildCommand: pip install python-telegram-bot==20.7 yt-dlp
+    startCommand: python bot.py
+    envVars:
+            - key: BOT_TOKEN
+        sync: false
