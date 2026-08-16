@@ -1,4 +1,18 @@
+from flask import Flask
+from threading import Thread
 import os
+
+# --- حل مشكلة التعليق في Render (يفتح بورت وهمي) ---
+app = Flask('')
+@app.route('/')
+def home():
+    return "Bot is alive! @Coin_YE_Bot"
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+Thread(target=run_flask, daemon=True).start()
+# --- نهاية الحل ---
+
 import re
 import asyncio
 import logging
@@ -7,166 +21,139 @@ import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
+logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ.get("BOT_TOKEN")
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-logging.basicConfig(level=logging.INFO)
-
-WELCOME = """
-🔥 **بوت Coin YE الجبار V2** 🔥
-
-أرسل أي رابط واختار الجودة اللي تبيها!
-
-📱 تيك توك (بدون علامة)
-📸 انستا | فيسبوك
-🎬 يوتيوب | تويتر | Kwai
-
-✨ الميزة الجديدة: اختيار الجودة قبل التحميل
-"""
-
-URL_PATTERN = re.compile(r'https?://\S+')
-# نخزن روابط المستخدمين مؤقتاً
-user_last_url = {}
-
-def is_url(text):
-    return bool(URL_PATTERN.search(text))
+# تخزين مؤقت للروابط
+url_cache = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(WELCOME, parse_mode='Markdown')
-
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    urls = URL_PATTERN.findall(text)
-    if not urls:
-        return
-    url = urls[0]
-    user_id = update.effective_user.id
-    user_last_url[user_id] = url
-
-    # نفحص الفيديو بسرعة بدون تحميل لنطلع العنوان
-    try:
-        def get_info():
-            with yt_dlp.YoutubeDL({'quiet': True, 'noplaylist': True}) as ydl:
-                return ydl.extract_info(url, download=False)
-        info = await asyncio.to_thread(get_info)
-        title = info.get('title', 'فيديو')[:60]
-    except:
-        title = "فيديو"
-
-    keyboard = [
-        [InlineKeyboardButton(f"🔥 أفضل جودة - {title[:20]}", callback_data="best")],
-        [
-            InlineKeyboardButton("🎬 720p HD", callback_data="720"),
-            InlineKeyboardButton("📱 480p", callback_data="480"),
-        ],
-        [
-            InlineKeyboardButton("📱 360p (حجم صغير)", callback_data="360"),
-            InlineKeyboardButton("🎵 صوت MP3 فقط", callback_data="mp3"),
-        ],
-        [InlineKeyboardButton("❌ إلغاء", callback_data="cancel")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     await update.message.reply_text(
-        f"✅ وجدت الفيديو:\n**{title}**\n\n👇 اختار الجودة اللي تبيها:",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
+        "👋 أهلاً بك في بوت التحميل!
+
+"
+        "أرسل رابط من يوتيوب، تيك توك، انستقرام، فيسبوك، تويتر ...
+"
+        "وسأعطيك خيارات الجودة للتحميل 🎬"
     )
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    if not re.match(r'https?://', url):
+        return
+    
+    msg = await update.message.reply_text("⏳ جاري فحص الرابط...")
+    
+    try:
+        ydl_opts = {'quiet': True, 'no_warnings': True, 'skip_download': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get('formats', [])
+            title = info.get('title', 'video')[:50]
+        
+        # فلترة الجودات
+        qualities = []
+        seen = set()
+        for f in formats:
+            if f.get('vcodec') != 'none' and f.get('height'):
+                h = f.get('height')
+                if h not in seen and h >= 144:
+                    seen.add(h)
+                    qualities.append(h)
+        qualities = sorted(list(seen), reverse=True)[:6]
+        
+        if not qualities:
+            await msg.edit_text("❌ لم أجد جودات متاحة، سأحمل أفضل جودة...")
+            # تحميل مباشر
+            await download_video(update, context, url, 'best')
+            return
+        
+        # حفظ الرابط
+        url_cache[update.effective_user.id] = url
+        
+        keyboard = []
+        for q in qualities:
+            keyboard.append([InlineKeyboardButton(f"📹 {q}p", callback_data=f"q_{q}")])
+        keyboard.append([InlineKeyboardButton("🔥 أفضل جودة", callback_data="q_best")])
+        
+        await msg.edit_text(
+            f"🎬 {title}
+
+اختر الجودة:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+    except Exception as e:
+        logging.error(e)
+        await msg.edit_text(f"❌ خطأ: {e}")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    choice = query.data
+    data = query.data
     user_id = query.from_user.id
-
-    if choice == "cancel":
-        await query.edit_message_text("❌ تم الإلغاء")
-        return
-
-    url = user_last_url.get(user_id)
+    url = url_cache.get(user_id)
+    
     if not url:
-        await query.edit_message_text("❌ الرابط انتهى، أرسله مرة ثانية")
+        await query.edit_message_text("❌ انتهت صلاحية الرابط، أرسله مرة أخرى")
         return
-
-    # خريطة الجودات
-    format_map = {
-        "best": 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        "720": 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]',
-        "480": 'bestvideo[height<=480][ext=mp4]+bestaudio/best[height<=480][ext=mp4]/best[height<=480]',
-        "360": 'bestvideo[height<=360][ext=mp4]+bestaudio/best[height<=360]',
-        "mp3": 'bestaudio/best'
-    }
-
-    ydl_opts = {
-        'format': format_map.get(choice, format_map['best']),
-        'outtmpl': str(DOWNLOAD_DIR / '%(title)s.%(ext)s'),
-        'noplaylist': True,
-        'quiet': True,
-        'no_warnings': True,
-    }
-
-    if choice == "mp3":
-        ydl_opts['postprocessors'] = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }]
-
-    await query.edit_message_text(f"⏳ جاري تحميل بجودة **{choice}**...\nقد يأخذ 15-30 ثانية، لا ترسل شي ثاني", parse_mode='Markdown')
-
-    file_path = None
+    
+    quality = data.replace("q_", "")
+    await query.edit_message_text(f"⏳ جاري التحميل بجودة {quality}...")
+    
     try:
-        def download():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                fname = ydl.prepare_filename(info)
-                # لو mp3، الاسم يتغير
-                if choice == "mp3":
-                    p = Path(fname)
-                    # yt-dlp يحولها لـ mp3
-                    possible = list(DOWNLOAD_DIR.glob(f"{p.stem}.*"))
-                    if possible:
-                        return str(possible[0]), info
-                return fname, info
-
-        file_path_str, info = await asyncio.to_thread(download)
-        file_path = Path(file_path_str)
-        # في حالة mp3 قد يكون الاسم مختلف
-        if not file_path.exists():
-            # دور على أحدث ملف
-            files = sorted(DOWNLOAD_DIR.glob("*"), key=lambda x: x.stat().st_mtime, reverse=True)
-            if files:
-                file_path = files[0]
-
-        caption = f"🎬 {info.get('title','')[:100]}\n💎 الجودة: {choice}\n\n🤖 @Coin_YE_Bot"
-
-        if choice == "mp3":
-            await context.bot.send_audio(chat_id=query.message.chat_id, audio=open(file_path, 'rb'), caption=caption)
-        else:
-            await context.bot.send_video(chat_id=query.message.chat_id, video=open(file_path, 'rb'), caption=caption, supports_streaming=True)
-
-        await query.delete_message()
-
+        await download_video_by_query(query, url, quality)
     except Exception as e:
-        await query.edit_message_text(f"❌ فشل: {str(e)[:400]}")
-    finally:
-        if file_path and file_path.exists():
-            try:
-                file_path.unlink()
-            except:
-                pass
-        user_last_url.pop(user_id, None)
+        logging.error(e)
+        await query.edit_message_text(f"❌ فشل التحميل: {e}")
+
+async def download_video(update, context, url, quality):
+    await update.message.reply_text("هذه الميزة قيد التشغيل...")
+    
+async def download_video_by_query(query, url, quality):
+    # إعداد الجودة
+    if quality == 'best':
+        fmt = 'bestvideo+bestaudio/best'
+    else:
+        fmt = f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]'
+    
+    ydl_opts = {
+        'format': fmt,
+        'outtmpl': str(DOWNLOAD_DIR / '%(title)s.%(ext)s'),
+        'merge_output_format': 'mp4',
+    }
+    
+    loop = asyncio.get_event_loop()
+    def dl():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, True)
+            return ydl.prepare_filename(info)
+    
+    filepath = await loop.run_in_executor(None, dl)
+    
+    # إرسال الملف
+    await query.message.reply_text("✅ تم التحميل، جاري الإرسال...")
+    with open(filepath, 'rb') as f:
+        await query.message.reply_video(video=f, caption=f"جودة {quality}")
+    
+    # حذف الملف بعد الإرسال
+    try:
+        os.remove(filepath)
+    except:
+        pass
 
 def main():
     if not TOKEN:
-        raise ValueError("BOT_TOKEN not set")
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    print("🚀 V2 Bot with Quality Selection Running...")
-    app.run_polling()
+        print("❌ BOT_TOKEN غير موجود!")
+        return
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    print("Bot is running...")
+    application.run_polling()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
